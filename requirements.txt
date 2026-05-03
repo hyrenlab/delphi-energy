@@ -1,0 +1,10 @@
+# Required: OpenAI-compatible LLM client (works with OpenAI, DeepSeek,
+# Together, Groq, OpenRouter, vLLM, anywhere /v1/chat/completions exists).
+openai>=1.0.0
+
+# Optional: enables DiscordWebhookNotifierAdapter when DELPHI_DISCORD_WEBHOOK_URL is set.
+requests>=2.28.0
+
+# Optional: enables HonchoMemoryAdapter (see examples/honcho_adapter.py).
+# Install only if you actually use Honcho.
+# honcho>=0.1.0
