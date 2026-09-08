@@ -1,10 +1,10 @@
 # Delphi Energy
 
-> A recursive adversarial judgment skill. Takes an important question, runs a
-> structured multi-role debate, surfaces the user's blind spots, and converges
-> into a fact-grounded verdict with a 24-hour first action.
+> A sequential multi-role judgment prototype. It organizes competing arguments,
+> highlights assumptions, and produces a model-generated Decision Brief and audit ledger.
 
-**Status**: v1.1 — feature-complete against the design spec. MIT licensed.
+**Status**: experimental v1.1 implementation; not feature-complete or independently
+fact-verified. MIT licensed. Python **3.10–3.13** is the CI target range.
 
 ## What it does
 
@@ -15,7 +15,7 @@ writing. **Dangerous for high-stakes judgment.**
 Delphi Energy challenges you the way a trusted strategic advisor would. It
 runs your question through:
 
-- **7 reasoning roles** in parallel — Advocate, Skeptic, Realist,
+- **7 reasoning roles** called sequentially — Advocate, Skeptic, Realist,
   Long-Termist, Game Theorist, Black Swan Scout, Analogist
 - **Cross-Exam** — Skeptic interrogates Advocate
 - **Red Team** — attacks *you*, not the question (sunk cost, identity
@@ -24,14 +24,13 @@ runs your question through:
   two different LLMs and surfaces disagreement
 - **Counterfactual Baseline** — generates 2-3 real alternatives so the verdict
   isn't a strawman comparison
-- **Evidence Auditor** — grades each major claim A/B/C/D
+- **Evidence Auditor** — asks a model to grade claims A/B/C/D from the debate; it does not retrieve or independently verify external sources
 - **Judge** — synthesizes everything with Pre-Mortem, Time Horizon split (now
   / 3-12mo / 1-3yr / 3-10yr), Contradiction Map, Evidence Threshold check,
   Noise Warning, Confidence (frequency framing — "in 10 similar cases this
   judgment is right ~7 times"), One-Line Bet, Biggest Risk, and a 24h First
   Domino
-- **Round-2 Cross-Exam** — auto-fires if Pre-Mortem reveals an attack vector
-  Round 1 missed
+- **Supplementary Round-2 Cross-Exam** — may run after Judge when a text-overlap heuristic flags a new Pre-Mortem topic. It is recorded in the ledger and does **not** revise the brief or action
 - **Optional drilldowns** — `--drill skeptic:"if runway were 1 month?"` to
   ask any role a follow-up
 
@@ -40,17 +39,33 @@ trail markdown ledger you can re-read 6 weeks later.
 
 ## Quick start
 
-```bash
-git clone <your-fork> delphi-energy
-cd delphi-energy
-pip install -r requirements.txt
+Start with the offline example (standard library only):
 
-export OPENAI_API_KEY=sk-...
-python delphi.py "should I take the job offer?"
+```bash
+git clone https://github.com/j1374483500-dot/delphi-energy.git
+cd delphi-energy
+python3 examples/offline.py
+python3 -m unittest discover -s tests -v
 ```
 
-You'll get the Decision Brief in your terminal, the full audit trail saved to
-`./ledger/2026-MM-DD_<slug>.md`, and per-stage progress streamed to stderr.
+The example exercises the actual five-call lite pipeline using **scripted responses**.
+It reads no personal history, sends no network requests, and saves no ledger.
+[Sample output](examples/offline-transcript.md) is synthetic, not a model benchmark.
+
+For live model calls, create an environment, install dependencies, and set your API
+key locally. Calls can incur charges; configure the token price estimates below.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+# Set OPENAI_API_KEY locally before running.
+python delphi.py "should I try a different meeting format?" --no-notify
+```
+
+The live CLI prints a Decision Brief and writes an audit trail to `./ledger/`.
+`--no-notify` suppresses external notifications even if a webhook is configured.
+`--no-vault` skips ledger writes; it does not disable history reads or notifications.
 
 ## Configuration
 
@@ -66,7 +81,10 @@ All via environment variables (no config file needed):
 | `DELPHI_SKEPTIC_ALT_PROVIDER`  | (primary)        | Provider for the multi-model dissent Skeptic |
 | `DELPHI_SKEPTIC_ALT_MODEL`     | `gpt-4o`         | Model for the multi-model dissent Skeptic |
 | `DELPHI_LEDGER_DIR`            | `./ledger/`      | Where ledger md files go |
-| `DELPHI_BUDGET_USD`            | `1.00`           | Per-run soft budget cap |
+| `DELPHI_BUDGET_USD`            | `1.00`           | Positive finite per-run **estimated** soft budget |
+| `DELPHI_PRICES_JSON`           | `{}`             | Exact `provider/model` keys mapped to `[input, output]` USD per million tokens |
+| `DELPHI_FALLBACK_INPUT_USD_PER_M` | `1.00`         | Hypothetical input rate for unconfigured models; not a vendor quote |
+| `DELPHI_FALLBACK_OUTPUT_USD_PER_M` | `5.00`        | Hypothetical output rate for unconfigured models; not a vendor quote |
 | `DELPHI_DISCORD_WEBHOOK_URL`   | (off)            | Enables DiscordWebhookNotifierAdapter |
 
 ## CLI
@@ -74,7 +92,7 @@ All via environment variables (no config file needed):
 ```bash
 python delphi.py "<question>"             # standard pipeline
 python delphi.py "<question>" --dry-run   # preview structure, no LLM calls
-python delphi.py "<question>" --no-vault  # stdout only, don't write file
+python delphi.py "<question>" --no-vault  # skip ledger write (notifications remain enabled)
 python delphi.py "<question>" --no-notify # skip Discord/etc, vault + stdout
 python delphi.py "<question>" --no-stream # suppress per-stage progress
 python delphi.py --describe               # print metadata JSON, exit
@@ -121,7 +139,7 @@ See `examples/` for templates:
 > **Do not serve the user's immediate preference. Serve the user's long-term
 > judgment.**
 
-7 principles, all enforced by the pipeline:
+7 design intentions reflected in the prompts and stages; these are not guaranteed output properties:
 
 1. **Reframe before answering** — many bad judgments come from bad framings
 2. **Generate structured opposition** — at least one role attacks the user's
@@ -137,27 +155,43 @@ See `examples/` for templates:
 
 Full design doc: see `DESIGN.md`.
 
-## Cost & latency
+## Cost estimates and limits
 
-Real measurements with `gpt-4o-mini` for most roles + `gpt-4o` for Judge:
+No reproducible live cost or latency benchmark is included. Earlier numerical
+performance claims were removed because their underlying traces are unavailable.
+The baseline successful paths use 5 calls (lite), 13 (standard), or 15
+(high-stakes), before optional round-2, drills, repairs, retries, or budget skips.
+These are code-path counts, not performance measurements.
 
-| Path | LLM calls | Wall time | Cost |
-|---|---|---|---|
-| Lite (high-rev / low-cost question) | 6 | ~120s | ~$0.02 |
-| Standard | 12 | ~240s | ~$0.05 |
-| High-stakes (with multi-model dissent + round-2) | 16 | ~330s | ~$0.10 |
+Prices are **user-configured estimates**, not fetched vendor prices. For example,
+`DELPHI_PRICES_JSON='{"fixture/model": [2, 8]}'` demonstrates the format using
+**fictional rates**. Configure every primary, alternate, and failover model using
+its actual provider/model key and your applicable rates. Unconfigured models use
+the clearly labeled hypothetical fallback rates. The ledger and CLI show the
+pricing assumptions. Zero rates are allowed for local/free models; negative,
+non-finite, and malformed prices are rejected. The budget must be finite and
+strictly positive.
 
-Wall time is dominated by the Judge call (60-100s). The cost cap is
-`DELPHI_BUDGET_USD` (default $1.00) — Delphi prunes stages once it hits 80%
-of cap.
+At 80% of estimated budget, the pipeline warns and continues. At 100%, checked
+optional stages are skipped. Intake, Judge, and Judge repair/retry can still run;
+one call or a multi-call stage can cross the limit. This is **not a hard spending
+cap**. Failed requests, cache discounts, reasoning tokens, and provider billing
+rules may make actual charges differ. Use provider-side controls for actual limits.
 
-## Anti-confabulation
+## Verification and limitations
 
-Earlier versions confabulated specifics. v0.9 fixed this:
-- Intake extracts a `user_asserted_facts` whitelist
-- Judge prompt enforces: any specific number / version / competitor must
-  trace back to user / memory / past ledger / role output, otherwise use
-  conditional language ("if X then Y") or mark `[推测]`
+Run the offline checks above; CI covers Python 3.10–3.13 without provider credentials.
+See [verification and limitations](docs/verification.md) for tested behavior and gaps.
+
+Intake's fact whitelist and Judge's source instructions are prompt safeguards.
+User assertions, memory, and role outputs can all be wrong. There is no independent
+source retrieval or factual verification in the default pipeline. A/B/C/D grades
+and confidence frequencies are model opinions, not calibrated measurements.
+JSON parsing and a single repair attempt do not validate the complete output schema;
+a failed Judge produces raw text without a Decision Brief or action.
+
+Round-2 is supplementary review after the verdict. Users must inspect it in the
+ledger; neither the current brief nor the next run is guaranteed to incorporate it.
 
 ## License
 

@@ -1,3 +1,5 @@
+<!-- These are design notes, not evidence of completed or measured capabilities. -->
+
 # Delphi Energy — Design Notes
 
 This document explains *why* each stage of the pipeline exists, what was
@@ -22,7 +24,7 @@ high-stakes judgment**.
 Delphi Energy challenges the user the way a trusted strategic advisor would.
 It must respect intuition but not become a tool for decorating bias.
 
-### Seven design principles (all enforced by the pipeline)
+### Seven design intentions (prompt guidance, not guaranteed properties)
 
 1. **Reframe before answering** — many bad judgments come from bad framings
 2. **Generate structured opposition** — at least one role attacks the user's
@@ -60,19 +62,19 @@ The pipeline auto-selects path based on `intake.cost_of_being_wrong` and
 **LITE path** (auto when `reversibility=high` AND `cost_of_being_wrong in
 {low, medium}`):
 - Skips Long-Termist, Game Theorist, Cross-Exam, Red Team
-- ~6 LLM calls, ~$0.02
+- 5 baseline successful LLM calls, excluding repairs/retries
 - For "should I switch text editors" type questions
 
 **STANDARD path** (default):
 - All 7 opening roles + Cross-Exam + Red Team + Counterfactual + Evidence
   Auditor + Judge
-- ~12 LLM calls, ~$0.05
+- 13 baseline successful LLM calls, excluding optional review/repairs/retries
 - For most strategic decisions
 
 **HIGH-STAKES** (auto when `cost_of_being_wrong in {high, catastrophic}`):
 - + Multi-Model Skeptic Dissent (run Skeptic on a 2nd LLM, surface
   disagreement to Judge)
-- ~16 LLM calls, ~$0.10
+- 15 baseline successful LLM calls, excluding optional review/repairs/retries
 - For irreversible career / financial / identity decisions
 
 ### 2.3 Stage-by-stage rationale
@@ -170,7 +172,7 @@ agreement and surfaces structural divergence. If divergence is real,
 flag it as its own transcript section the Judge must address.
 
 This catches the "single LLM converges to one cognitive style" failure
-mode. Costs ~$0.012 extra; only fires when `cost_of_being_wrong` is high.
+mode. Adds two LLM calls; only fires when `cost_of_being_wrong` is high.
 
 #### Counterfactual Baseline (§ 7.15)
 
@@ -215,7 +217,7 @@ The single biggest stage. Synthesizes everything. Mandatory output fields:
 Plus a `narrative` field — 300-500 word readable verdict that integrates
 all of the above.
 
-JSON output enforced with schema in the system prompt. Auto-repair retry on
+JSON object requested with a schema in the system prompt; full schema validation is not implemented. Auto-repair retry on
 parse fail (one extra LLM call asking the model to fix its own JSON).
 Timeout bumped to 240s + retry-once because the Judge call is the most
 expensive to lose.
@@ -227,8 +229,9 @@ not after, because it must be allowed to change the conclusion."
 
 We do this differently: Pre-Mortem is *inside* Judge, then we run a
 **Round-2 Cross-Exam** that re-attacks Advocate using whatever the
-Pre-Mortem revealed. Judge gets to react to Round 2 in the next run if the
-user re-invokes Delphi.
+Pre-Mortem revealed. This is supplementary post-verdict review: it does not
+change the current brief or action. A subsequent run is not guaranteed to
+retrieve or incorporate these questions; the user must carry them forward.
 
 A cheap heuristic skips Round 2 if the Pre-Mortem theme already appears in
 Round 1.
@@ -327,20 +330,18 @@ core.
 
 ## 6. Cost & latency model
 
-Real measurements with `gpt-4o-mini` (most roles) + `gpt-4o` (Judge):
+No reproducible live performance benchmark is included. Historical dollar and
+latency claims have been removed because their source traces are unavailable.
+Stages, including all seven openings, run sequentially.
 
-| Path | LLM calls | Wall time | Cost USD |
-|---|---|---|---|
-| Lite | 6 | ~120s | ~$0.02 |
-| Standard | 12 | ~240s | ~$0.05 |
-| High-stakes | 16 | ~330s | ~$0.10 |
+`DELPHI_PRICES_JSON` configures exact provider/model token rates in USD per million
+input/output tokens. Unconfigured models use explicitly labeled hypothetical
+fallback assumptions, not verified vendor prices. The ledger records these rates.
+See README for configuration and billing limitations.
 
-**Wall time is dominated by the Judge call** (60-100s on reasoning models).
-Stages run sequentially because later stages consume earlier outputs;
-parallelizing the openings would help but isn't yet implemented.
-
-**Cost cap**: `DELPHI_BUDGET_USD` (default $1.00). Pipeline emits a warning
-event at 80% and prunes non-essential stages once it hits 100%.
+`DELPHI_BUDGET_USD` is a positive finite **estimated soft budget**. The pipeline
+warns at 80% and skips checked optional stages at 100%. Intake, Judge, and Judge
+repair/retry can still run and exceed the limit. This is not a hard spend cap.
 
 ---
 

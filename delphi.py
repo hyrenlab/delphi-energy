@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-delphi.py — Delphi Energy: Recursive adversarial judgment skill.
+delphi.py — Delphi Energy: Sequential adversarial judgment prototype.
 
 Open-source release (v1.1). License: MIT (see LICENSE).
 
@@ -9,13 +9,13 @@ What it does
 Takes an important question, decomposes it, runs 7 specialized reasoning
 roles (Advocate / Skeptic / Realist / Long-Termist / Game Theorist /
 Black Swan Scout / Analogist), runs Cross-Exam + Red Team + Counterfactual
-+ Evidence Auditor, then has a Judge synthesize a fact-grounded verdict
++ Evidence Auditor, then has a Judge produce a model-generated verdict
 with Pre-Mortem, Time Horizon split, Contradiction Map, Evidence Threshold
 check, Noise Warning, and a 24-hour first action.
 
 Pipeline (event-driven dynamic shape — runs only what each Q needs):
 
-  STANDARD path (default, ~14 LLM calls, ~330s with reasoning models):
+  STANDARD path (13 calls before optional dissent, review, retries or drills):
     Intake (KAU 4-tier fact boundary + time horizon hints)
     → Adaptive Bias check (no-op unless adapter wired)
     → Past Ledger lookup (file-glob + keyword match)
@@ -30,8 +30,8 @@ Pipeline (event-driven dynamic shape — runs only what each Q needs):
     → Judge (synthesis + Pre-Mortem + Time Horizon + Contradiction Map
              + Counterfactual Check + Evidence Threshold + Noise Warning
              + Confidence + One-Line Bet + 24h First Domino + Validation
-             Signals; fact-grounded; JSON-repair retry)
-    → Round-2 Cross-Exam (if Pre-Mortem reveals new attack vector)
+             Signals; not externally verified; JSON-repair retry)
+    → Supplementary Round-2 Cross-Exam (does not revise the verdict)
     → Action (one-line bet + first domino + validation signals)
     → Optional Drilldowns (--drill ROLE:Q for post-verdict follow-up)
 
@@ -51,7 +51,7 @@ ENV variables
     DELPHI_DEFAULT_MODEL        default model (default: "gpt-4o-mini")
     DELPHI_JUDGE_MODEL          model for Judge stage (default: same)
     DELPHI_LEDGER_DIR           where ledger files go (default: ./ledger/)
-    DELPHI_BUDGET_USD           per-run budget cap in USD (default: 1.00)
+    DELPHI_BUDGET_USD           estimated soft budget in USD (default: 1.00)
     DELPHI_DISCORD_WEBHOOK_URL  enables Discord notifier
     DELPHI_HONCHO_BASE_URL      enables Honcho memory adapter
     DELPHI_HONCHO_PEER_ID       Honcho peer name (default: "user")
@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
@@ -117,8 +118,51 @@ ROLE_PROVIDER = {
     "judge":          ("openai", _JUDGE_MODEL),
 }
 
-# Budget cap per Delphi run (USD). Override via env DELPHI_BUDGET_USD.
-BUDGET_USD_LIMIT = float(os.environ.get("DELPHI_BUDGET_USD", "1.00"))
+def _valid_amount(value, name: str, *, positive: bool = False) -> float:
+    """Reject invalid configuration before any provider call."""
+    try:
+        amount = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite number") from exc
+    if isinstance(value, bool) or not math.isfinite(amount) or amount < 0 or (positive and amount == 0):
+        raise ValueError(f"{name} must be finite and {'positive' if positive else 'non-negative'}")
+    return amount
+
+
+def _load_prices(raw: str) -> dict[str, tuple[float, float]]:
+    """JSON provider/model -> [input, output] USD per million tokens."""
+    try:
+        values = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("DELPHI_PRICES_JSON must be a JSON object") from exc
+    if not isinstance(values, dict):
+        raise ValueError("DELPHI_PRICES_JSON must be a JSON object")
+    prices = {}
+    for key, pair in values.items():
+        if not isinstance(key, str) or '/' not in key or not all(key.split('/', 1)):
+            raise ValueError("Price keys must use provider/model")
+        if not isinstance(pair, list) or len(pair) != 2:
+            raise ValueError(f"Price for {key} must be [input, output]")
+        prices[key] = tuple(_valid_amount(v, f"price for {key}") for v in pair)
+    return prices
+
+
+# Estimates only: fallback values are hypothetical planning assumptions,
+# not vendor prices. Supply current rates for every routed model yourself.
+BUDGET_USD_LIMIT = _valid_amount(os.environ.get("DELPHI_BUDGET_USD", "1.00"),
+                               "DELPHI_BUDGET_USD", positive=True)
+MODEL_PRICES = _load_prices(os.environ.get("DELPHI_PRICES_JSON", "{}"))
+FALLBACK_PRICES = (
+    _valid_amount(os.environ.get("DELPHI_FALLBACK_INPUT_USD_PER_M", "1.00"), "fallback input price"),
+    _valid_amount(os.environ.get("DELPHI_FALLBACK_OUTPUT_USD_PER_M", "5.00"), "fallback output price"),
+)
+
+
+def _pricing_note() -> str:
+    return ("Estimated cost only; configured USD/M input-output rates: "
+            f"{json.dumps(MODEL_PRICES, sort_keys=True)}. Unconfigured models use "
+            f"hypothetical fallback {FALLBACK_PRICES[0]:g}/{FALLBACK_PRICES[1]:g}, "
+            "not verified vendor prices. Soft budget; actual charges may differ.")
 
 # ── Failover routing per role ────────────────────────────────────────────
 # If primary (provider, model) call fails (timeout/5xx/auth), try fallback.
@@ -348,6 +392,11 @@ class DelphiTranscript:
     def total_cost(self) -> float:
         return sum(e.cost_usd or 0 for e in self.events)
 
+    def llm_call_count(self) -> int:
+        """Count recorded calls, including zero-cost and grouped dissent calls."""
+        return sum(e.payload.get("llm_calls", 1) for e in self.events
+                   if e.cost_usd is not None)
+
     def total_tokens(self) -> tuple[int, int]:
         ti = sum(e.tokens_in or 0 for e in self.events)
         to = sum(e.tokens_out or 0 for e in self.events)
@@ -382,8 +431,8 @@ class DelphiTranscript:
         return (
             f"# Delphi Energy: {self._reframed_or_raw()}\n\n"
             f"> **{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}** · "
-            f"cost ${self.total_cost():.3f} · "
-            f"{len([e for e in self.events if e.cost_usd])} LLM calls · "
+            f"estimated cost ${self.total_cost():.3f} · "
+            f"{self.llm_call_count()} LLM calls · "
             f"{ti:,} prompt tok / {to:,} completion tok · "
             f"{self.latency_seconds():.0f}s"
         )
@@ -402,6 +451,8 @@ class DelphiTranscript:
             (b.get("confidence") or "").lower(), "⚪"
         )
         lines = ["## 🎯 Decision Brief"]
+        if any(e.type == "cross_exam" and e.payload.get("round") == 2 for e in self.events):
+            lines.append("\n_Post-verdict questions are in the full ledger; this brief and action have not been revised in response._")
         lines.append("")
         lines.append(f"**问题**:{self._reframed_or_raw()}")
         lines.append("")
@@ -486,7 +537,7 @@ class DelphiTranscript:
 
     def _render_appendix(self) -> str:
         lines = ["---", "", "# Appendix:运行元数据", ""]
-        lines.append("| 阶段 | Role | Provider | Model | Tokens (in/out) | Cost |")
+        lines.append("| 阶段 | Role | Provider | Model | Tokens (in/out) | Estimated cost |")
         lines.append("|---|---|---|---|---|---|")
         for ev in self.events:
             if ev.cost_usd is None:
@@ -502,8 +553,9 @@ class DelphiTranscript:
         lines.append(f"| **TOTAL** | | | | **{ti:,} / {to:,}** | **${self.total_cost():.4f}** |")
         lines.append("")
         lines.append(f"- 总时长:{self.latency_seconds():.0f}s")
-        lines.append(f"- Budget 上限:${BUDGET_USD_LIMIT:.2f}")
-        lines.append(f"- Budget 使用率:{self.total_cost()/BUDGET_USD_LIMIT*100:.0f}%")
+        lines.append(f"- Soft budget 上限:${BUDGET_USD_LIMIT:.2f}")
+        lines.append("- " + _pricing_note())
+        lines.append(f"- Estimated budget 使用率:{self.total_cost()/BUDGET_USD_LIMIT*100:.0f}%")
         return "\n".join(lines)
 
     # ─── Vault ledger save ───────────────────────────────────────────────
@@ -671,7 +723,8 @@ def _render_cross_exam(p: dict) -> str:
     target = p.get("target", "?")
     content = p.get("content", "")
     round_n = p.get("round", 1)
-    return f"## 交叉质询 轮次 {round_n}: {attacker} → {target}\n\n{content}"
+    note = "\n\n_Post-verdict review: does not revise the Decision Brief or action._" if round_n == 2 else ""
+    return f"## 交叉质询 轮次 {round_n}: {attacker} → {target}{note}\n\n{content}"
 
 
 def _render_red_team(p: dict) -> str:
@@ -883,15 +936,8 @@ def _call_llm_for_role(
 
 
 def _estimate_cost(provider: str, model: str, tokens_in: int, tokens_out: int) -> float:
-    """Rough cost. Real budget tracker has accurate prices; this is for transcript display."""
-    # Per-million-token pricing approximation
-    pricing = {
-        ("deepseek", "deepseek-v4-pro"): (0.27, 1.10),
-        ("deepseek", "deepseek-v4-flash"): (0.04, 0.20),
-        ("openai-codex", "gpt-5.5"): (1.25, 10.00),  # Codex is more expensive
-        ("gemini", "gemini-2.5-flash"): (0.075, 0.30),
-    }
-    p_in, p_out = pricing.get((provider, model), (1.0, 5.0))
+    """Token-based estimate using explicit rates or labeled planning assumptions."""
+    p_in, p_out = MODEL_PRICES.get(f"{provider}/{model}", FALLBACK_PRICES)
     return (tokens_in * p_in + tokens_out * p_out) / 1_000_000
 
 
@@ -1290,13 +1336,21 @@ def _safe_json_load(s: str) -> dict | None:
     m = re.search(r"```(?:json)?\s*\n(.*?)\n```", s, flags=re.DOTALL)
     if m:
         s = m.group(1)
+    # Reject valid non-object JSON before attempting prose extraction.
+    try:
+        parsed = json.loads(s)
+    except (ValueError, TypeError):
+        pass
+    else:
+        return parsed if isinstance(parsed, dict) else None
     # Find first {…} block
     m = re.search(r"\{.*\}", s, flags=re.DOTALL)
     if m:
         s = m.group(0)
     try:
-        return json.loads(s)
-    except Exception:
+        parsed = json.loads(s)
+        return parsed if isinstance(parsed, dict) else None
+    except (ValueError, TypeError):
         return None
 
 
@@ -1332,7 +1386,7 @@ def _budget_check_or_warn(transcript: DelphiTranscript) -> bool:
         transcript.emit(
             "budget_warning",
             used_usd=used, used_pct=pct,
-            action="预算用至 80%,后续 stage 会从严裁剪。",
+            action="估算预算用至 80%,仅警告并继续；达到 100% 才跳过可选阶段。",
         )
     return True
 
@@ -1404,7 +1458,7 @@ _ROLE_META = {
     # role_key: (display_name, icon, system_prompt, max_output_tokens)
     # Note: bumped vs initial draft after first real run truncated Realist
     # mid-sentence at 500. 350-字 prose target ≠ 350 tokens because zh chars
-    # vary. Give comfortable headroom (700) — we still cap at < $0.20/run.
+    # vary. Give comfortable headroom (700) — this is a token limit, not a dollar spend guarantee.
     "advocate":         ("Advocate", "🟢", ADVOCATE_SYSTEM, 700),
     "skeptic":          ("Skeptic", "🔴", SKEPTIC_SYSTEM, 700),
     "realist":          ("Realist", "⚙️", REALIST_SYSTEM, 700),
@@ -1447,7 +1501,7 @@ def _build_role_user_msg(intake: dict, memory_view: str | None) -> str:
 
 def _stage_opening_round(intake: dict, memory_view: str | None,
                          transcript: DelphiTranscript) -> dict[str, str]:
-    """4 roles speak in parallel-ish (sequential here for v0.1, no asyncio).
+    """Opening roles speak sequentially; lite mode uses three roles.
 
     Returns dict role → content for downstream cross-exam / judge consumption.
     """
@@ -1939,6 +1993,7 @@ def _stage_multi_model_skeptic(intake: dict, memory_view: str | None,
         tokens_in=ti + jti, tokens_out=to + jto,
         cost_usd=cost + jcost,
         provider=f"{alt_provider}+{jprov}", model=f"{alt_model}+{jmdl}",
+        llm_calls=2,
         **payload,
     )
     _stream("multi_skeptic", "done",
@@ -1952,7 +2007,7 @@ def _stage_round_2_cross_exam(intake: dict, brief: dict | None,
                               openings: dict[str, str],
                               cross_exam_round_1: str | None,
                               transcript: DelphiTranscript) -> str | None:
-    """v0.8: Round-2 cross-exam triggered by Judge's Pre-Mortem reveal.
+    """Supplementary post-verdict review; does not revise the brief or action.
 
     Logic:
     - Only runs on standard path (not lite) and when Judge produced a brief
@@ -2156,6 +2211,8 @@ def run_delphi(question: str, *, dry_run: bool = False,
         return transcript
 
     # Real pipeline
+    _valid_amount(BUDGET_USD_LIMIT, "DELPHI_BUDGET_USD", positive=True)
+    _stream("pricing", "estimate-only", basis=_pricing_note())
     _stream("pipeline", "start", chars=len(question))
     intake = _stage_intake(question, transcript)
     if _is_lite_path(intake):
@@ -2212,7 +2269,7 @@ def run_delphi(question: str, *, dry_run: bool = False,
         _stage_drilldown(role_key, drill_q, transcript)
     _stream("pipeline", "done",
             usd=transcript.total_cost(),
-            calls=len([e for e in transcript.events if e.cost_usd]),
+            calls=transcript.llm_call_count(),
             secs=transcript.latency_seconds())
     return transcript
 
@@ -2254,7 +2311,7 @@ def describe() -> dict:
         "summary": (
             "Delphi Energy: multi-role adversarial judgment pipeline. Takes a "
             "question, runs 7 reasoning roles, cross-exam, red team, "
-            "counterfactual, evidence audit, and a fact-grounded Judge with "
+            "counterfactual, evidence audit, and a model-based Judge with "
             "Pre-Mortem, Time Horizon split, Contradiction Map, Evidence "
             "Threshold check, Noise Warning, Confidence (frequency framing), "
             "One-Line Bet, and 24h First Domino. Outputs a Decision Brief + "
@@ -2290,13 +2347,10 @@ def describe() -> dict:
                      "Repeatable."},
         ],
         "cost_estimate": {
-            "llm_calls_lite": 6,
-            "llm_calls_standard": 12,
-            "llm_calls_high_stakes": 16,
-            "llm_tokens_est": 22000,
-            "duration_seconds_p50": 240.0,
-            "usd_p50": 0.045,
-            "usd_p95": 0.10,
+            "basis": _pricing_note(),
+            "soft_budget_usd": BUDGET_USD_LIMIT,
+            "benchmarked": False,
+            "baseline_calls_without_retries_or_optional_review": {"lite": 5, "standard": 13, "high_stakes": 15},
         },
         "adapters": {
             "llm": type(ADAPTERS["llm"]).__name__,
@@ -2304,23 +2358,24 @@ def describe() -> dict:
             "bias": type(ADAPTERS["bias"]).__name__,
             "notifier": type(ADAPTERS["notifier"]).__name__,
         },
-        "design_doc": "https://github.com/<your-fork>/delphi-energy/blob/main/DESIGN.md",
+        "design_doc": "https://github.com/j1374483500-dot/delphi-energy/blob/main/DESIGN.md",
     }
 
 
 def _print_brief_to_stdout(transcript: DelphiTranscript) -> None:
+    print(_pricing_note())
     print("\n" + "=" * 60)
     print(transcript.render_brief_only())
     print("=" * 60)
-    print(f"\n💰 Cost: ${transcript.total_cost():.4f}"
+    print(f"\n💰 Estimated cost: ${transcript.total_cost():.4f}"
           f" · ⏱ {transcript.latency_seconds():.1f}s"
-          f" · 📞 {len([e for e in transcript.events if e.cost_usd])} LLM calls")
+          f" · 📞 {transcript.llm_call_count()} LLM calls")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="delphi",
-        description="Delphi Energy — recursive adversarial judgment skill",
+        description="Delphi Energy — sequential adversarial judgment prototype",
     )
     parser.add_argument("question", nargs="?",
                         help="Question to judge (quoted)")

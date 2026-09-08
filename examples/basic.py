@@ -20,5 +20,5 @@ if __name__ == "__main__":
     )
     transcript = run_delphi(question)
     print(transcript.render_brief_only())
-    print(f"\nFull transcript saved to: {transcript.events[0].payload}")
-    print(f"Cost: ${transcript.total_cost():.4f}")
+    print("\nFull transcript (not saved):\n" + transcript.render())
+    print(f"Estimated cost: ${transcript.total_cost():.4f}")
