@@ -54,3 +54,27 @@ with dated configuration, prompts, source evidence, and redacted provider traces
 Round-2 questions are stored after Judge and do not revise the action. A new run
 is not guaranteed to retrieve them. Review the ledger and explicitly include any
 important unresolved question in a follow-up run.
+
+## Metadata migration for integrations
+
+This maintenance change updates the JSON returned by `python delphi.py --describe`
+and Python `describe()`. The metadata still reports implementation version `1.1`;
+that field is not a schema-version guarantee. Consumers using `cost_estimate`
+must migrate when upgrading to this maintenance commit:
+
+| Previous `cost_estimate` key | Replacement or action |
+|---|---|
+| `llm_calls_lite` | `baseline_calls_without_retries_or_optional_review.lite` (5) |
+| `llm_calls_standard` | `baseline_calls_without_retries_or_optional_review.standard` (13) |
+| `llm_calls_high_stakes` | `baseline_calls_without_retries_or_optional_review.high_stakes` (15) |
+| `llm_tokens_est` | Removed; no supported replacement estimate |
+| `duration_seconds_p50` | Removed; no reproducible latency benchmark |
+| `usd_p50` and `usd_p95` | Removed; no reproducible cost benchmark |
+
+The new keys `basis`, `soft_budget_usd`, and `benchmarked` describe the configured
+pricing assumptions, estimated soft limit, and absence of a live benchmark
+(`false`). Baseline call counts exclude optional review, drills, retries, repairs,
+and budget skips; they are not predicted actual usage. Read the returned transcript
+for recorded usage, and treat removed benchmark values as unavailable rather than
+zero. Integrations needing the former shape should pin their previous commit until
+they adopt the new schema; unsupported benchmark aliases are deliberately omitted.
