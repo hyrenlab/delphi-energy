@@ -42,7 +42,7 @@ trail markdown ledger you can re-read 6 weeks later.
 Start with the offline example (standard library only):
 
 ```bash
-git clone https://github.com/j1374483500-dot/delphi-energy.git
+git clone https://github.com/hyrenlab/delphi-energy.git
 cd delphi-energy
 python3 examples/offline.py
 python3 -m unittest discover -s tests -v
